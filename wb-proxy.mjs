@@ -23,8 +23,11 @@ const DEFAULT_MODEL = 'deepseek-v4.1-flash';
 // 当前 WorkBuddy 限时免费(credit=0)的模型; step-5-preview 促销 2026-10-26 截止, 其余到 2026-11-01
 const FREE_MODELS = ['deepseek-v4.1-flash', 'hy3', 'step-5-preview'];
 const PAID_MODELS = ['deepseek-v4.1-flash-sg'];
+// 付费模型开关: 默认禁用(拦截), 避免意外扣费; 设 WB_ALLOW_PAID=1 并重启可重新开启
+const ALLOW_PAID = process.env.WB_ALLOW_PAID === '1';
 const AUTH_DIR = path.join(os.homedir(), '.wb-proxy');
-const AUTH_FILE = path.join(AUTH_DIR, 'auth.json');
+// 默认鉴权文件; 设 WB_AUTH_FILE 可让 login 把 token 存到指定路径(用于构建账号池, 不覆盖当前在用文件)
+const AUTH_FILE = process.env.WB_AUTH_FILE || path.join(AUTH_DIR, 'auth.json');
 
 // ---------------- 弹性网络层 ----------------
 // 本机若有 fake-ip 模式 VPN(Clash/Surge 等), 系统 DNS 会返回 198.18.x.x 假地址,
@@ -74,8 +77,9 @@ async function readAll(stream) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-async function apiJson(method, p, { body, headers = {} } = {}) {
-  const res = await resilientRequest(`${ENDPOINT}${p}`, {
+// 支持自定义端点(账号池里不同账号可能归属不同 region: 国际版 workbuddy.ai / 国内版 workbuddy.cn)
+async function apiJsonAt(base, method, p, { body, headers = {} } = {}) {
+  const res = await resilientRequest(`${base}${p}`, {
     method,
     headers: { 'Content-Type': 'application/json', ...headers },
     body: body ? JSON.stringify(body) : null,
@@ -84,6 +88,8 @@ async function apiJson(method, p, { body, headers = {} } = {}) {
   let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
   return { status: res.statusCode, json };
 }
+// 默认走全局 ENDPOINT(国际版); 国内版账号通过各自 domain 走 apiJsonAt
+async function apiJson(method, p, opts) { return apiJsonAt(ENDPOINT, method, p, opts); }
 
 // 逐条解析 SSE data: 事件
 async function* sseEvents(stream) {
@@ -120,9 +126,10 @@ async function login() {
   const { json } = await apiJson('POST', `${PREFIX}/auth/state?platform=CLI`, { body: {} });
   const d = json?.data;
   if (!d?.authUrl || !d?.state) { console.error('获取 authUrl 失败:', JSON.stringify(json)); process.exit(1); }
-  console.log('\n请用浏览器打开下面链接, 登录你的 WorkBuddy 账号(与桌面 App 同一账号):\n');
+  console.log('\n请复制下面链接, 在已登录目标账号的浏览器 / 无痕窗口中手动打开并完成授权');
+  console.log('(默认不再自动打开浏览器, 避免用错账号; 如需自动打开请设 WB_OPEN=1)\n');
   console.log('  ' + d.authUrl + '\n');
-  exec(`open ${JSON.stringify(d.authUrl)}`);
+  if (process.env.WB_OPEN === '1') exec(`open ${JSON.stringify(d.authUrl)}`);
   console.log('等待登录完成(最长 10 分钟)...');
   const deadline = Date.now() + 600_000;
   while (Date.now() < deadline) {
@@ -142,25 +149,142 @@ async function login() {
   console.error('\n登录超时'); process.exit(1);
 }
 
-async function refreshIfNeeded(auth) {
-  if (!auth?.refreshToken) return auth;
-  const expiresAt = auth.expiresAt ?? 0;
-  if (Date.now() < expiresAt - 120_000) return auth; // 还有 2 分钟以上
-  console.log('[auth] accessToken 快过期, 刷新中...');
-  const { status, json } = await apiJson('POST', `${PREFIX}/auth/token/refresh`, {
+// 把 token 持久化到指定文件(账号池里的每个账号各存各的)
+function saveAuthToFile(a, file) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(a, null, 2), { mode: 0o600 });
+}
+
+// ---------------- 账号池 / 负载均衡 ----------------
+// 账号池目录 ~/.wb-proxy/pool/*.json, 每个文件一个账号(来自 WB_AUTH_FILE=... login);
+// 不存在池时回退到单一 auth.json(向后兼容)。运行时按各自 domain 路由(国际版/国内版通吃)。
+const POOL_DIR = path.join(AUTH_DIR, 'pool');
+const ACTIVE_FILE = path.join(AUTH_DIR, 'active'); // 钉选账号名; 内容写 auto 表示不钉选
+const LB_STRATEGY = process.env.WB_LB || 'roundrobin'; // roundrobin | random
+const DEFAULT_COOLDOWN_MS = Number(process.env.WB_COOLDOWN_MS) || 60_000; // 限流类冷却时长
+let pool = [];
+let rrCursor = 0;
+
+// 重新扫描磁盘, 合并新增账号, 同时保留内存中的冷却/计时状态
+function syncPool() {
+  const found = new Map();
+  if (fs.existsSync(POOL_DIR)) {
+    for (const f of fs.readdirSync(POOL_DIR).sort()) {
+      if (!f.endsWith('.json')) continue;
+      const file = path.join(POOL_DIR, f);
+      let auth; try { auth = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { continue; }
+      if (!auth?.accessToken) continue;
+      found.set(f.slice(0, -5), { name: f.slice(0, -5), file, auth });
+    }
+  }
+  if (!found.size && fs.existsSync(AUTH_FILE)) {
+    let auth; try { auth = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8')); } catch { auth = null; }
+    if (auth?.accessToken) found.set('default', { name: 'default', file: AUTH_FILE, auth });
+  }
+  const next = [];
+  for (const [name, info] of found) {
+    const prev = pool.find(e => e.name === name);
+    next.push({ ...info, cooldownUntil: prev?.cooldownUntil || 0, lastUsed: prev?.lastUsed || 0 });
+  }
+  pool = next;
+}
+
+function readPinned() {
+  try { const s = fs.readFileSync(ACTIVE_FILE, 'utf8').trim(); return s && s !== 'auto' ? s : null; } catch { return null; }
+}
+
+// 本轮可参与的账号顺序: 跳过冷却中的; 钉选则只保留钉选账号
+function orderedHealthyEntries() {
+  const pinned = process.env.WB_ACCOUNT || readPinned();
+  const now = Date.now();
+  const healthy = pool.filter(e => e.cooldownUntil <= now);
+  if (!healthy.length) return [];
+  if (pinned) {
+    const e = healthy.find(e => e.name === pinned);
+    return e ? [e] : [];
+  }
+  const n = pool.length;
+  const start = rrCursor % n;
+  const order = [];
+  for (let i = 0; i < n; i++) {
+    const e = pool[(start + i) % n];
+    if (e.cooldownUntil <= now) order.push(e);
+  }
+  rrCursor = (start + 1) % n;
+  return order;
+}
+
+// 解析上游限流返回里的重置时间(如 code 6004 的 "reset at 2026-10-17 13:00:31 UTC+8")
+function parseResetTime(text) {
+  try {
+    const m = String(text).match(/reset at\s*([\d\-]+\s*[\d:]+)(?:\s*(UTC\+8|GMT\+8))?/i);
+    if (m) {
+      const ds = m[1].replace(/\//g, '-');
+      const t = Date.parse(ds + (m[2] ? ' GMT+8' : ''));
+      if (!Number.isNaN(t) && t > Date.now()) return t;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+// 按账号各自的 domain 刷新 token(写回该账号自己的文件)
+async function refreshEntry(entry) {
+  if (!entry?.auth?.refreshToken) return entry.auth;
+  const expiresAt = entry.auth.expiresAt ?? 0;
+  if (Date.now() < expiresAt - 120_000) return entry.auth; // 还有 2 分钟以上
+  const { status, json } = await apiJsonAt(entry.auth.domain ? 'https://' + entry.auth.domain : ENDPOINT, 'POST', `${PREFIX}/auth/token/refresh`, {
     body: {},
-    headers: { 'X-Refresh-Token': auth.refreshToken, Authorization: `Bearer ${auth.accessToken}` },
+    headers: { 'X-Refresh-Token': entry.auth.refreshToken, Authorization: `Bearer ${entry.auth.accessToken}` },
   });
   const data = json?.data?.data ?? json?.data;
   if (status === 200 && data?.accessToken) {
-    const next = { ...auth, ...data, savedAt: Date.now() };
+    const next = { ...entry.auth, ...data, savedAt: Date.now() };
     if (next.expiresIn) next.expiresAt = Date.now() + next.expiresIn * 1000;
-    saveAuth(next);
-    console.log('[auth] 刷新成功');
-    return next;
+    entry.auth = next;
+    saveAuthToFile(next, entry.file);
   }
-  console.error('[auth] 刷新失败, 沿用旧 token:', status, JSON.stringify(json).slice(0, 300));
-  return auth;
+  return entry.auth;
+}
+
+// 账号池负载均衡 + 故障转移:
+//  - 轮询选择健康账号
+//  - 401: 刷新该账号 token 后重试一次
+//  - 429/配额耗尽: 把该账号冷却, 自动切下一个账号(直到池里账号用尽)
+async function withPoolRetry(upstreamBody) {
+  syncPool();
+  if (!pool.length) return { error: [401, { error: { message: '账号池为空, 先运行: WB_AUTH_FILE=~/.wb-proxy/pool/<账号>.json node wb-proxy.mjs login' } }] };
+  const order = orderedHealthyEntries();
+  if (!order.length) {
+    const soonest = Math.min(...pool.map(e => e.cooldownUntil));
+    return { error: [429, { error: { message: `账号池所有账号均处于冷却(最早 ${new Date(soonest).toLocaleString()}), 请稍后重试` } }] };
+  }
+  const tried401 = new Set();
+  for (const entry of order) {
+    let auth = await refreshEntry(entry);
+    let up;
+    try { up = await callUpstream(auth, upstreamBody); }
+    catch (e) { return { error: [502, { error: { message: 'upstream connect failed: ' + e.message } }] }; }
+    // 401: 刷新后重试同账号一次
+    if (up.status === 401 && !tried401.has(entry.name)) {
+      up.stream.destroy();
+      entry.auth.expiresAt = 0; saveAuthToFile(entry.auth, entry.file);
+      tried401.add(entry.name);
+      try { up = await callUpstream(await refreshEntry(entry), upstreamBody); }
+      catch (e) { return { error: [502, { error: { message: 'upstream connect failed: ' + e.message } }] }; }
+    }
+    if (up.ok) { entry.lastUsed = Date.now(); return { up, entry }; }
+    const text = await up.text().catch(() => '');
+    const isRate = up.status === 429 || /usage exceeds frequency limit|quota|额度|频率|frequency limit/i.test(text);
+    if (isRate) {
+      const reset = parseResetTime(text);
+      entry.cooldownUntil = reset || Date.now() + DEFAULT_COOLDOWN_MS;
+      console.log(`[lb] 账号 ${entry.name} 限流, 冷却至 ${new Date(entry.cooldownUntil).toLocaleTimeString()}${reset ? ' (按上游重置时间)' : ''}, 切换到下一账号`);
+      continue; // 试下一个账号
+    }
+    // 其它错误(模型不存在/参数错误等)直接返回, 不重试
+    return { up, entry: null, detail: text };
+  }
+  return { error: [429, { error: { message: '账号池所有账号当前均限流/配额耗尽, 已自动冷却, 请稍后重试' } }] };
 }
 
 // ---------------- 公共 ----------------
@@ -210,18 +334,22 @@ function officialClientHeaders() {
 }
 
 async function callUpstream(auth, upstreamBody) {
+  // 按账号各自的 domain 路由: 国际版 www.workbuddy.ai / 国内版 www.workbuddy.cn
+  const ep = auth?.domain ? 'https://' + auth.domain : ENDPOINT;
+  const chatUrl = `${ep}/v2/chat/completions`;
   const headers = {
     'Content-Type': 'application/json',
     Authorization: `Bearer ${auth.accessToken}`,
     Accept: 'text/event-stream',
     ...officialClientHeaders(),
   };
+  headers['X-Domain'] = new URL(ep).hostname; // 覆盖 officialClientHeaders 里写死的全局域名
   const uid = auth?.account?.uid ?? auth?.uid ?? jwtSub(auth.accessToken);
   if (uid) headers['X-User-Id'] = encodeURIComponent(String(uid));
   if (process.env.WB_DEBUG) {
     fs.writeFileSync(path.join(AUTH_DIR, 'last-request.json'), JSON.stringify(upstreamBody, null, 2));
   }
-  const res = await resilientRequest(CHAT_URL, { method: 'POST', headers, body: JSON.stringify(upstreamBody) });
+  const res = await resilientRequest(chatUrl, { method: 'POST', headers, body: JSON.stringify(upstreamBody) });
   return {
     ok: res.statusCode >= 200 && res.statusCode < 300,
     status: res.statusCode,
@@ -257,32 +385,7 @@ async function collectChatCompletion(stream) {
   return { id, object: 'chat.completion', created, model, choices: [{ index: 0, message: msg, finish_reason: finish }], usage };
 }
 
-// 处理 401 刷新重试 + 429 限流退避重试(官方客户端同样会自动重试)
-async function withAuthRetry(fn, retried401 = false, retries429 = 0) {
-  let auth = loadAuth();
-  if (!auth?.accessToken) return { error: [401, { error: { message: 'proxy 未登录, 先运行: node wb-proxy.mjs login' } }] };
-  auth = await refreshIfNeeded(auth);
-  let up;
-  try {
-    up = await fn(auth);
-  } catch (e) {
-    return { error: [502, { error: { message: 'upstream connect failed: ' + e.message } }] };
-  }
-  if (up.status === 401 && !retried401 && auth.refreshToken) {
-    up.stream.destroy();
-    auth.expiresAt = 0; saveAuth(auth);
-    await refreshIfNeeded(loadAuth());
-    return withAuthRetry(fn, true, retries429);
-  }
-  if (up.status === 429 && retries429 < 3) {
-    up.stream.destroy();
-    const waitMs = [4000, 10000, 20000][retries429];
-    console.log(`[retry] 上游 429, ${waitMs / 1000}s 后第 ${retries429 + 1} 次重试`);
-    await new Promise(r => setTimeout(r, waitMs));
-    return withAuthRetry(fn, retried401, retries429 + 1);
-  }
-  return { up };
-}
+// (已废弃) 单账号重试逻辑已被 withPoolRetry(账号池负载均衡 + 故障转移) 取代
 
 // ---------------- Chat Completions ----------------
 
@@ -303,11 +406,16 @@ async function handleChat(req, res, body) {
     model: inBody.model && inBody.model !== 'default' ? inBody.model : DEFAULT_MODEL,
     stream: true, // 上游只支持流式
   };
+  // 付费模型禁用: 默认拦截, 避免意外扣费(设 WB_ALLOW_PAID=1 可放行)
+  if (!ALLOW_PAID && PAID_MODELS.includes(upstreamBody.model)) {
+    return sendJson(res, 403, { error: { message: `付费模型 ${upstreamBody.model} 已被本代理禁用, 以避免扣费。如确需使用请设置 WB_ALLOW_PAID=1 后重启代理。` } });
+  }
 
-  const { up, error } = await withAuthRetry(auth => callUpstream(auth, upstreamBody));
-  if (error) return sendJson(res, error[0], error[1]);
+  const r = await withPoolRetry(upstreamBody);
+  if (r.error) return sendJson(res, r.error[0], r.error[1]);
+  const { up } = r;
   if (!up.ok) {
-    const text = await up.text().catch(() => '');
+    const text = r.detail || await up.text().catch(() => '');
     return sendJson(res, up.status, { error: { message: `upstream ${up.status}`, detail: text.slice(0, 2000) } });
   }
 
@@ -373,6 +481,10 @@ function responsesToChat(inBody) {
   if (typeof inBody.top_p === 'number') chat.top_p = inBody.top_p;
   if (typeof inBody.max_output_tokens === 'number') chat.max_tokens = inBody.max_output_tokens;
   if (typeof inBody.parallel_tool_calls === 'boolean') chat.parallel_tool_calls = inBody.parallel_tool_calls;
+  // Responses API 用 reasoning:{effort} 表达推理强度, 上游只认 reasoning_effort, 需要翻译
+  // (原先漏了这一步, 导致客户端设的推理强度被静默丢弃)
+  const reasoningEffort = inBody.reasoning?.effort ?? inBody.reasoning_effort;
+  if (reasoningEffort) chat.reasoning_effort = reasoningEffort;
   if (inBody.stop) chat.stop = inBody.stop;
   if (Array.isArray(inBody.tools)) {
     const tools = inBody.tools.filter(t => t?.type === 'function')
@@ -507,14 +619,19 @@ async function handleResponses(req, res, body) {
   try { inBody = JSON.parse(body); } catch { return sendJson(res, 400, { error: { message: 'invalid json body' } }); }
   const wantStream = inBody.stream === true;
   const chatBody = responsesToChat(inBody);
+  // 付费模型禁用: 默认拦截, 避免意外扣费(设 WB_ALLOW_PAID=1 可放行)
+  if (!ALLOW_PAID && PAID_MODELS.includes(chatBody.model)) {
+    return sendJson(res, 403, { error: { message: `付费模型 ${chatBody.model} 已被本代理禁用, 以避免扣费。如确需使用请设置 WB_ALLOW_PAID=1 后重启代理。` } });
+  }
   if (!chatBody.messages.length || chatBody.messages[0]?.role !== 'system') {
     chatBody.messages.unshift({ role: 'system', content: DEFAULT_SYSTEM_PROMPT });
   }
 
-  const { up, error } = await withAuthRetry(auth => callUpstream(auth, chatBody));
-  if (error) return sendJson(res, error[0], error[1]);
+  const r = await withPoolRetry(chatBody);
+  if (r.error) return sendJson(res, r.error[0], r.error[1]);
+  const { up } = r;
   if (!up.ok) {
-    const text = await up.text().catch(() => '');
+    const text = r.detail || await up.text().catch(() => '');
     return sendJson(res, up.status, { error: { message: `upstream ${up.status}`, detail: text.slice(0, 2000) } });
   }
 
@@ -529,6 +646,7 @@ async function handleResponses(req, res, body) {
 // ---------------- serve ----------------
 
 function serve(port, localKey, host = '127.0.0.1') {
+  syncPool();
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     if (localKey) {
@@ -538,7 +656,7 @@ function serve(port, localKey, host = '127.0.0.1') {
     if (req.method === 'GET' && (url.pathname === '/v1/models' || url.pathname === '/models')) {
       return sendJson(res, 200, { object: 'list', data: [
         ...FREE_MODELS.map(id => ({ id, object: 'model', owned_by: 'workbuddy', free: true })),
-        ...PAID_MODELS.map(id => ({ id, object: 'model', owned_by: 'workbuddy', free: false })),
+        ...(ALLOW_PAID ? PAID_MODELS : []).map(id => ({ id, object: 'model', owned_by: 'workbuddy', free: false })),
       ] });
     }
     if (req.method === 'POST' && (url.pathname === '/v1/chat/completions' || url.pathname === '/chat/completions')) {
@@ -547,7 +665,33 @@ function serve(port, localKey, host = '127.0.0.1') {
     if (req.method === 'POST' && (url.pathname === '/v1/responses' || url.pathname === '/responses')) {
       return handleResponses(req, res, await readAll(req));
     }
-    if (req.method === 'GET' && url.pathname === '/health') return sendJson(res, 200, { ok: true, authed: !!loadAuth()?.accessToken });
+    if (req.method === 'GET' && url.pathname === '/health') {
+      syncPool();
+      const now = Date.now();
+      return sendJson(res, 200, {
+        ok: true,
+        poolSize: pool.length,
+        healthy: pool.filter(e => e.cooldownUntil <= now).length,
+        accounts: pool.map(e => ({ name: e.name, domain: e.auth.domain || 'www.workbuddy.ai', healthy: e.cooldownUntil <= now, cooldownUntil: e.cooldownUntil })),
+      });
+    }
+    if (req.method === 'GET' && (url.pathname === '/v1/accounts' || url.pathname === '/accounts')) {
+      syncPool();
+      const now = Date.now();
+      return sendJson(res, 200, {
+        object: 'account_pool',
+        strategy: (process.env.WB_ACCOUNT || readPinned()) ? 'pinned' : LB_STRATEGY,
+        pinned: process.env.WB_ACCOUNT || readPinned() || null,
+        data: pool.map(e => ({
+          name: e.name,
+          domain: e.auth.domain || 'www.workbuddy.ai',
+          healthy: e.cooldownUntil <= now,
+          cooldownUntil: e.cooldownUntil,
+          expiresAt: e.auth.expiresAt || null,
+          sub: (() => { try { return JSON.parse(Buffer.from((e.auth.accessToken || '').split('.')[1] || '', 'base64url').toString('utf8')).sub; } catch { return null; } })(),
+        })),
+      });
+    }
     sendJson(res, 404, { error: { message: 'not found' } });
   });
   server.listen(port, host, () => {
